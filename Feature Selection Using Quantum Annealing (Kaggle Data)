@@ -1,0 +1,134 @@
+# importing libraries
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+import glob
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import f1_score
+from sklearn.linear_model import LogisticRegression
+import dimod
+from dwave.system import DWaveCliqueSampler
+from dwave.system import EmbeddingComposite, DWaveSampler
+from dimod import BinaryQuadraticModel
+from dwave.cloud import Client
+import dwave.inspector
+from sklearn.feature_selection import SelectKBest,f_classif,mutual_info_classif
+from scipy import stats
+import itertools
+import random
+# Read the training file
+train = pd.read_csv("../input/jane-street-market-prediction/train.csv")
+
+# Fill NaN values with 0 and remove records whose weight is 0
+train=train.fillna(0)
+train=train[train.weight!=0]
+
+# calculate the ground truth (target_value in this case) values
+weight=train.weight
+resp=train.resp
+resp_1=train.resp_1
+resp_2=train.resp_2
+resp_3=train.resp_3
+resp_4=train.resp_4
+target_value=(weight*resp)+(weight*resp_1)+(weight*resp_2)+(weight*resp_3)+(weight*resp_4)
+
+# Assign 0 (to passing on the trade) and 1 (to make the trade) and add the ground truth column to the train set
+label_list=[]
+mean_target=np.mean(target_value)
+std_target=np.std(target_value)
+for sample in target_value:
+    if sample>=mean_target:
+        label_list.append(1)
+    else:
+        label_list.append(0)
+train['Action']=label_list
+
+# create a train set with only the features and another one with only the ground truth values
+target_label=train['Action']
+new_train=train.drop(['date', 'weight', 'resp_1', 'resp_2', 'resp_3', 'resp_4', 'resp','ts_id', 'Action',
+       'Target_value'],axis=1)
+
+# Compute pair wise mutual info score of the feature with the target variable and dump in a csv file
+feature_names=new_train.columns
+coeff_list_label=[]
+feature_names_new=[]
+for feature in feature_names:
+    variable=new_train[feature].values
+    variable=variable.reshape(-1,1)
+    score_label=mutual_info_classif(variable,target_label)
+    coeff_list_label.append(score_label)
+    feature_names_new.append(feature)
+df_info=pd.DataFrame({
+			'Names':feature_names,
+			'Score':coeff_list_label})
+df_info.to_csv('target_correlation')
+
+# Compute pair wise pearson coorelation between features and dump it in a csv file
+corr_matrix=new_train.corr(method='pearson')
+corr_matrix.to_csv('variable_variable_corr.csv')
+
+# Preprocess the two csv files
+df_target=pd.read_csv('target_correlation.csv')
+df_target = df_target.loc[:, ~df_target.columns.str.contains('^Unnamed')]
+df_target=df_target.set_index('Names')
+df_target=df_target.T
+df_variables=pd.read_csv('variable_variable_corr.csv')
+df_variables=df_variables.set_index('Unnamed: 0')
+variables_array=df_variables.values
+feature_names=df_variables.columns
+feature_names=list(feature_names)
+
+# Initialize list to append best selected features per bootstrap
+selected_feature_list=[]
+# Initialize other variables:
+no_bootstrap=50
+no_variables=64
+
+# Run the bootstrap loop
+for i in range(0,no_bootstrap):
+	# Randomly sample 64 features each time
+    feature_names=random.sample(feature_names, 64)
+	# Initialize a BQM
+    bqm = dimod.BinaryQuadraticModel.empty(dimod.BINARY)
+	# Add the pairwise mutual_info_score with the target variable as the bias of the variable
+    for feature in feature_names:
+        coeff=df_target[feature]
+        coeff=coeff.values
+        coeff=coeff[0]
+        # coeff=float(coeff)
+        bqm.add_variable(feature, coeff)
+    # Add the pairwise pearson correlation between variables as the weight between the variables   
+    for f0, f1 in itertools.combinations(feature_names, 2):
+        index_1=int(''.join(filter(str.isdigit, f0)))
+        index_2=int(''.join(filter(str.isdigit, f1)))
+        coeff=variables_array[index_1][index_2]
+        bqm.add_interaction(f0, f1, coeff)
+        bqm.add_interaction(f1, f0, coeff)
+    #Initialize a clique sampler
+    sampler = DWaveCliqueSampler(solver=dict(qpu=True))
+	# Sample the best solution from 1000 reads
+    response = sampler.sample(bqm, num_reads=1000).first.sample
+	# Append only those features in the selected_feature_list that occurs atleast once
+    keys=response.keys()
+    for key in keys:
+        if(response[key]==1):
+            selected_feature_list.append(key)
+# Create a dataframe with the selected features and their counts and dump it in a csv file
+base_string='feature_'
+feature_name_list=[]
+for i in range(0,130):
+    feature_name_list.append(base_string+str(i))
+count_list=[]
+for features in feature_name_list:
+    count_list.append(selected_feature_list.count(features))
+
+df_count=pd.DataFrame({
+    'Feature':feature_name_list,
+    'Count':count_list})
+df_count.to_csv('counts.csv')   
+
+
+
+
+
+
